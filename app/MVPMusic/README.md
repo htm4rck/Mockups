@@ -285,12 +285,3 @@ gantt
 ```
 
 ---
-
-## 10. Desarrollo local
-
-```bash
-npm install
-npm run dev
-```
-
-La aplicación corre en [http://localhost:2222](http://localhost:2222).
