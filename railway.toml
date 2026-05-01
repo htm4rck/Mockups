@@ -6,8 +6,11 @@ buildCommand = "npm run build"
 nixPkgs = ["nodejs_20"]
 
 [deploy]
-startCommand = "PROJECT_ROOT=/app npm run start"
+startCommand = "npm run start"
 healthcheckPath = "/"
-healthcheckTimeout = 30
+healthcheckTimeout = 60
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+
+[deploy.envVars]
+PROJECT_ROOT = "/app"
