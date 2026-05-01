@@ -94,9 +94,6 @@ export default function SidebarServer() {
   const mdNodes = buildRootMdNodes();
 
   const tree: FileNode[] = [
-    ...(mdNodes.length > 0
-      ? [{ name: 'docs', path: '', type: 'folder' as const, children: mdNodes }]
-      : []),
     ...appTree,
   ];
 
