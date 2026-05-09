@@ -51,14 +51,14 @@ graph TD
         AD[API Admin]
     end
 
-    subgraph Infra["Infraestructura"]
-        PG[(PostgreSQL)]
-        RD[(Redis)]
-        MQ[RabbitMQ / Kafka]
-        ST[Object Storage\nS3 · R2 · Azure Blob]
-        CDN[CDN\nCloudFront · Cloudflare · Azure CDN]
-        OB[Observabilidad\nGrafana · Prometheus · Loki · Sentry]
-        DK[Docker / Kubernetes]
+    subgraph Infra["Infraestructura AWS"]
+        PG[(RDS PostgreSQL)]
+        RD[(ElastiCache Redis)]
+        MQ[RabbitMQ Docker / Amazon MQ]
+        ST[S3]
+        CDN[CloudFront]
+        OB[CloudWatch · X-Ray · Grafana AMG]
+        DK[ECS Fargate / EKS]
     end
 
     NestJS --> PG
@@ -239,14 +239,14 @@ graph LR
     end
 
     subgraph Storage["Contenido"]
-        H[Cloudflare R2\nAWS S3\nAzure Blob]
-        I[CDN\nCloudflare · CloudFront]
+        H[AWS S3]
+        I[CloudFront CDN]
     end
 
     subgraph Ops["Operaciones"]
-        J[Grafana · Prometheus\nLoki · Sentry]
-        K[Docker Compose\nMVP]
-        L[Kubernetes\nAzure Container Apps\nProducción]
+        J[CloudWatch · X-Ray\nGrafana AMG]
+        K[Docker + ECS Fargate\nMVP y Producción]
+        L[EKS Kubernetes\nEscala 2000+]
     end
 
     A --> D
@@ -379,56 +379,90 @@ Estimación de costos mensuales para distintas escalas de operación. Los precio
 
 ### Escenario: 100 locales activos
 
-| Servicio | Proveedor | Costo mensual estimado |
-|----------|-----------|------------------------|
-| Object Storage (250 GB) | Cloudflare R2 | ~$4 (sin egress) |
-| CDN / Egress (~360 GB) | Cloudflare (incluido en R2) | $0 |
-| Servidor backend (2 vCPU, 4 GB) | AWS EC2 t3.medium / Azure B2s | ~$30–40 |
-| PostgreSQL managed (básico) | AWS RDS db.t3.micro / Azure Flexible | ~$15–25 |
-| Redis (cache, 1 GB) | AWS ElastiCache t3.micro / Upstash | ~$10–15 |
-| RabbitMQ | Self-hosted en mismo servidor | $0 (incluido) |
-| Observabilidad | Grafana Cloud Free + Sentry Free | $0 |
-| **Total estimado** | | **~$60–85/mes** |
+| Servicio | AWS Service | Costo mensual estimado |
+|----------|-------------|------------------------|
+| Object Storage (250 GB) | S3 Standard | ~$6 |
+| CDN / Egress (~360 GB) | CloudFront | ~$32 |
+| Backend dockerizado (2 vCPU, 4 GB) | ECS Fargate (1 task) | ~$30–40 |
+| Container Registry | ECR | ~$1 |
+| PostgreSQL managed | RDS db.t3.micro | ~$15–20 |
+| Redis (1 GB) | ElastiCache t3.micro | ~$12 |
+| RabbitMQ (dockerizado en Fargate) | ECS Fargate (0.25 vCPU, 0.5 GB) | ~$10 |
+| Observabilidad | CloudWatch + X-Ray (free tier) | $0 |
+| **Total estimado** | | **~$105–120/mes** |
 
 ### Escenario: 500 locales activos
 
-| Servicio | Proveedor | Costo mensual estimado |
-|----------|-----------|------------------------|
-| Object Storage (250 GB) | Cloudflare R2 | ~$4 |
-| CDN / Egress (~1.8 TB) | Cloudflare (incluido) | $0 |
-| Backend (4 vCPU, 8 GB + réplica) | AWS EC2 t3.large × 2 | ~$120–160 |
-| PostgreSQL managed | AWS RDS db.t3.small | ~$30–50 |
-| Redis (3 GB) | AWS ElastiCache t3.small | ~$25–40 |
+| Servicio | AWS Service | Costo mensual estimado |
+|----------|-------------|------------------------|
+| Object Storage (250 GB) | S3 Standard | ~$6 |
+| CDN / Egress (~1.8 TB) | CloudFront | ~$150 |
+| Backend dockerizado (4 vCPU, 8 GB × 2 tasks) | ECS Fargate | ~$120–160 |
+| Container Registry | ECR | ~$2 |
+| PostgreSQL managed | RDS db.t3.small | ~$30–45 |
+| Redis (3 GB) | ElastiCache t3.small | ~$25–35 |
 | RabbitMQ managed | Amazon MQ (mq.m5.large) | ~$60 |
-| Observabilidad | Grafana Cloud Pro | ~$30 |
-| **Total estimado** | | **~$270–345/mes** |
+| Load Balancer | ALB | ~$20 |
+| Observabilidad | CloudWatch + Grafana AMG | ~$30 |
+| **Total estimado** | | **~$445–510/mes** |
 
 ### Escenario: 2,000 locales activos
 
-| Servicio | Proveedor | Costo mensual estimado |
-|----------|-----------|------------------------|
-| Object Storage (500 GB) | Cloudflare R2 | ~$8 |
-| CDN / Egress (~7.2 TB) | Cloudflare (incluido) | $0 |
-| Backend (Kubernetes, 3 nodos) | Azure AKS / AWS EKS | ~$300–450 |
-| PostgreSQL (HA, réplicas) | AWS RDS db.r6g.large | ~$150–200 |
-| Redis Cluster (6 GB) | AWS ElastiCache r6g.large | ~$80–120 |
+| Servicio | AWS Service | Costo mensual estimado |
+|----------|-------------|------------------------|
+| Object Storage (500 GB) | S3 Standard | ~$12 |
+| CDN / Egress (~7.2 TB) | CloudFront (committed pricing) | ~$500–600 |
+| Backend dockerizado (Kubernetes) | EKS + Fargate (3 nodos) | ~$300–450 |
+| Container Registry | ECR | ~$5 |
+| PostgreSQL (HA, réplicas) | RDS db.r6g.large Multi-AZ | ~$200–280 |
+| Redis Cluster (6 GB) | ElastiCache r6g.large | ~$80–120 |
 | Kafka / Event streaming | Amazon MSK (kafka.m5.large × 3) | ~$400–500 |
-| Observabilidad completa | Grafana Cloud + Sentry Team | ~$80–100 |
-| **Total estimado** | | **~$1,020–1,380/mes** |
+| Load Balancer | ALB | ~$25 |
+| Observabilidad completa | CloudWatch + Grafana AMG + X-Ray | ~$80–100 |
+| **Total estimado** | | **~$1,600–2,080/mes** |
 
-### ¿Por qué Cloudflare R2 como opción principal de storage?
+### Nota sobre CloudFront y egress
 
-| Concepto | AWS S3 | Cloudflare R2 |
-|----------|--------|---------------|
-| Almacenamiento (250 GB) | ~$5.75 | ~$3.75 |
-| Egress (1 TB) | ~$90 | **$0** |
-| Egress (5 TB) | ~$450 | **$0** |
+| Concepto | S3 directo | S3 + CloudFront |
+|----------|-----------|------------------|
+| Egress (1 TB) | ~$90 | ~$85 (con cache hit ~60%) |
+| Egress (5 TB) | ~$450 | ~$340 (committed use discount) |
+| Egress (5 TB + cache local 80%) | ~$90 | ~$68 |
 
-Para una plataforma de streaming donde el egress es el costo dominante, R2 reduce drásticamente la factura. Si se requiere AWS por compliance, se puede usar **S3 + CloudFront** con pricing comprometido.
+El cache cifrado en Electron reduce el egress real entre un **70–90%**, ya que los locales solo descargan tracks nuevos. Con CloudFront Security Savings Bundle se puede reducir un 30% adicional sobre el precio on-demand.
 
-### Nota sobre el impacto del cache local
+### Arquitectura Docker en AWS
 
-El cache cifrado en Electron reduce el egress real entre un **70–90%**, ya que los locales solo descargan tracks nuevos. Esto significa que los costos de CDN/egress en la tabla ya contemplan el peor caso; en operación real serán significativamente menores.
+```mermaid
+graph TD
+    subgraph ECR["ECR — Container Registry"]
+        IMG_API[nestjs-api:latest]
+        IMG_RMQ[rabbitmq:latest]
+        IMG_WK[worker:latest]
+    end
+
+    subgraph ECS["ECS Fargate — Producción"]
+        API[NestJS API\n2–4 vCPU, 4–8 GB]
+        WK[Worker de eventos\n0.5 vCPU, 1 GB]
+        RMQ[RabbitMQ\n0.25 vCPU, 0.5 GB]
+    end
+
+    subgraph Managed["Servicios managed AWS"]
+        RDS[(RDS PostgreSQL)]
+        EC[(ElastiCache Redis)]
+        S3[S3 + CloudFront]
+    end
+
+    ECR --> ECS
+    API --> RDS
+    API --> EC
+    API --> RMQ
+    WK --> RMQ
+    WK --> RDS
+    API --> S3
+```
+
+> **Estrategia:** Todo lo que es código propio (API, workers) se dockeriza y corre en ECS Fargate (serverless containers, sin gestionar EC2). Los servicios de datos (PostgreSQL, Redis) se usan managed para evitar overhead operativo. En escala de 2,000+ locales se migra a EKS.
 
 ---
 
@@ -439,17 +473,19 @@ gantt
     title Roadmap MVP Music
     dateFormat YYYY-MM
     section Fase 1 — Core
-    API NestJS + Auth + Catálogo     :2025-01, 2M
-    Reproductor Electron             :2025-02, 2M
-    Cache local y modo offline       :2025-03, 2M
-    Admin Web básico                 :2025-03, 2M
+    API NestJS + Auth + Catálogo           :2026-06, 2M
+    Reproductor Electron + Cache offline   :2026-07, 2M
+    Admin Web (Next.js)                    :2026-07, 2M
+    Dockerización completa + CI/CD         :2026-08, 1M
+    Deploy AWS (ECS Fargate)               :2026-08, 1M
     section Fase 2 — Escala
-    App móvil Android y iOS          :2025-05, 3M
-    Analytics avanzado               :2025-06, 2M
-    Exportación Excel y PDF          :2025-07, 1M
+    Analytics y reportes                   :2026-09, 2M
+    App móvil Android                      :2026-10, 3M
+    Exportación Excel y PDF                :2026-11, 1M
     section Fase 3 — Expansión
-    Soporte video y pantallas        :2025-08, 3M
-    Kubernetes y producción          :2025-09, 2M
+    Soporte video y pantallas              :2027-01, 3M
+    Migración a EKS (Kubernetes)           :2027-02, 2M
+    App iOS                                :2027-03, 2M
 ```
 
 ---
