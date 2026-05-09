@@ -264,7 +264,175 @@ graph LR
 
 ---
 
-## 9. Roadmap de fases
+## 9. Protección de audio — Fragmentación y cifrado local
+
+El audio almacenado en cache local **nunca se guarda como archivos MP3/AAC completos**. Se aplica un esquema de fragmentación y cifrado inspirado en el modelo de Spotify (OGG fragmentado con claves efímeras), adaptado al contexto B2B.
+
+### Estrategia técnica
+
+| Capa | Mecanismo |
+|------|----------|
+| Fragmentación | Cada track se divide en chunks de 5–15 segundos durante la descarga |
+| Cifrado por chunk | Cada fragmento se cifra con AES-256-GCM usando una clave derivada por sesión |
+| Clave efímera | La clave de descifrado se obtiene del backend y se almacena solo en memoria (nunca en disco) |
+| Rotación de claves | Las claves rotan cada vez que el local se reconecta; el cache se re-cifra con la nueva clave |
+| Sin archivo reconstruible | Los chunks no contienen headers válidos de MP3/AAC; sin la clave + el mapa de fragmentos, el audio es inútil |
+| Integridad | Cada chunk incluye un HMAC que el player valida antes de reproducir; si falla, se descarta y re-descarga |
+| Ofuscación de storage | Los archivos en disco usan nombres UUID sin extensión, sin metadatos legibles |
+
+### Flujo de reproducción segura
+
+```mermaid
+sequenceDiagram
+    participant E as Electron Player
+    participant M as Memory (RAM)
+    participant D as Disco (Cache cifrado)
+    participant API as Backend
+
+    E->>API: Solicita clave de sesión (JWT + device fingerprint)
+    API-->>E: Clave AES efímera (válida por sesión)
+    E->>M: Almacena clave solo en RAM
+    E->>D: Lee chunk cifrado del disco
+    E->>M: Descifra chunk en memoria
+    M-->>E: PCM decodificado → reproduce
+    Note over E,D: Si el proceso muere, la clave se pierde.<br/>Al reiniciar, solicita nueva clave al backend.
+```
+
+### ¿Qué pasa si un usuario intenta extraer el audio?
+
+| Ataque | Mitigación |
+|--------|------------|
+| Copiar archivos del disco | Solo obtiene blobs cifrados sin headers, inútiles sin clave |
+| Interceptar tráfico de red | CDN entrega chunks con token firmado de corta duración; HTTPS obligatorio |
+| Dump de memoria RAM | Requiere acceso root; solo expone el chunk actual (5–15s), no el track completo |
+| Descompilar Electron (ASAR) | El código se ofusca y la clave nunca está hardcodeada; se obtiene del backend por sesión |
+| Grabar salida de audio (loopback) | Fuera del alcance técnico; se mitiga contractualmente en los términos de servicio |
+
+> **Principio:** El cache local es un buffer de reproducción cifrado, no una biblioteca de archivos. Sin conexión al backend para obtener la clave, el cache expira y se vuelve irrecuperable.
+
+---
+
+## 10. Sesiones — Modelo 1:1 por tipo de aplicación
+
+Cada tipo de cliente tiene un modelo de sesión distinto, diseñado para evitar uso compartido de credenciales y proteger el contenido.
+
+### Electron (Player de local)
+
+- **Una sola sesión activa** por credencial de local.
+- Si el mismo local inicia sesión en otro dispositivo, la sesión anterior se **invalida inmediatamente** vía WebSocket (`session:revoked`).
+- El dispositivo desconectado detiene la reproducción y muestra aviso de "sesión activa en otro equipo".
+- Se registra un `device_fingerprint` (MAC + hostname + disco) para detectar cambios de hardware no autorizados.
+
+### Web de administración (Next.js)
+
+- Sesión estándar con JWT + refresh token.
+- **Reproducción limitada a preview**: máximo 30–60 segundos por track.
+- No permite descarga ni cache de audio.
+- Pensada para monitoreo, configuración y reportes, no para consumo musical.
+- Múltiples sesiones permitidas por usuario admin (multi-pestaña), pero con rate limiting.
+
+### Diagrama de invalidación
+
+```mermaid
+sequenceDiagram
+    participant L1 as Local (Dispositivo A)
+    participant API as Backend
+    participant RD as Redis
+    participant L2 as Local (Dispositivo B)
+
+    L1->>API: Login (local_id: 42)
+    API->>RD: session:local:42 = device_A
+    API-->>L1: Token + sesión activa
+
+    Note over L1: Reproduciendo normalmente...
+
+    L2->>API: Login (local_id: 42)
+    API->>RD: session:local:42 = device_B (sobreescribe)
+    API-->>L2: Token + sesión activa
+    API->>L1: WebSocket → session:revoked
+    L1->>L1: Detiene reproducción + muestra alerta
+```
+
+### Resumen por tipo de cliente
+
+| Cliente | Sesiones simultáneas | Audio completo | Cache local | Invalidación |
+|---------|---------------------|----------------|-------------|---------------|
+| Electron (local) | 1 | ✅ | ✅ Cifrado | Inmediata vía WebSocket |
+| Web admin | Múltiples | ❌ Solo preview (30–60s) | ❌ | Por expiración de JWT |
+| App móvil (Fase 2) | 1 por local | ✅ | ✅ Cifrado | Misma lógica que Electron |
+
+---
+
+## 11. Costos de infraestructura
+
+Estimación de costos mensuales para distintas escalas de operación. Los precios son referenciales y varían según proveedor y negociación.
+
+### Variables base
+
+| Parámetro | Valor estimado |
+|-----------|----------------|
+| Tamaño promedio por track (MP3 192kbps) | ~5 MB |
+| Tracks reproducidos por local/día | ~120 (8h continuas) |
+| Ancho de banda por local/mes (sin cache) | ~18 GB |
+| Ancho de banda por local/mes (con cache 80% hit) | ~3.6 GB |
+| Catálogo total almacenado | 50,000 tracks ≈ 250 GB |
+
+### Escenario: 100 locales activos
+
+| Servicio | Proveedor | Costo mensual estimado |
+|----------|-----------|------------------------|
+| Object Storage (250 GB) | Cloudflare R2 | ~$4 (sin egress) |
+| CDN / Egress (~360 GB) | Cloudflare (incluido en R2) | $0 |
+| Servidor backend (2 vCPU, 4 GB) | AWS EC2 t3.medium / Azure B2s | ~$30–40 |
+| PostgreSQL managed (básico) | AWS RDS db.t3.micro / Azure Flexible | ~$15–25 |
+| Redis (cache, 1 GB) | AWS ElastiCache t3.micro / Upstash | ~$10–15 |
+| RabbitMQ | Self-hosted en mismo servidor | $0 (incluido) |
+| Observabilidad | Grafana Cloud Free + Sentry Free | $0 |
+| **Total estimado** | | **~$60–85/mes** |
+
+### Escenario: 500 locales activos
+
+| Servicio | Proveedor | Costo mensual estimado |
+|----------|-----------|------------------------|
+| Object Storage (250 GB) | Cloudflare R2 | ~$4 |
+| CDN / Egress (~1.8 TB) | Cloudflare (incluido) | $0 |
+| Backend (4 vCPU, 8 GB + réplica) | AWS EC2 t3.large × 2 | ~$120–160 |
+| PostgreSQL managed | AWS RDS db.t3.small | ~$30–50 |
+| Redis (3 GB) | AWS ElastiCache t3.small | ~$25–40 |
+| RabbitMQ managed | Amazon MQ (mq.m5.large) | ~$60 |
+| Observabilidad | Grafana Cloud Pro | ~$30 |
+| **Total estimado** | | **~$270–345/mes** |
+
+### Escenario: 2,000 locales activos
+
+| Servicio | Proveedor | Costo mensual estimado |
+|----------|-----------|------------------------|
+| Object Storage (500 GB) | Cloudflare R2 | ~$8 |
+| CDN / Egress (~7.2 TB) | Cloudflare (incluido) | $0 |
+| Backend (Kubernetes, 3 nodos) | Azure AKS / AWS EKS | ~$300–450 |
+| PostgreSQL (HA, réplicas) | AWS RDS db.r6g.large | ~$150–200 |
+| Redis Cluster (6 GB) | AWS ElastiCache r6g.large | ~$80–120 |
+| Kafka / Event streaming | Amazon MSK (kafka.m5.large × 3) | ~$400–500 |
+| Observabilidad completa | Grafana Cloud + Sentry Team | ~$80–100 |
+| **Total estimado** | | **~$1,020–1,380/mes** |
+
+### ¿Por qué Cloudflare R2 como opción principal de storage?
+
+| Concepto | AWS S3 | Cloudflare R2 |
+|----------|--------|---------------|
+| Almacenamiento (250 GB) | ~$5.75 | ~$3.75 |
+| Egress (1 TB) | ~$90 | **$0** |
+| Egress (5 TB) | ~$450 | **$0** |
+
+Para una plataforma de streaming donde el egress es el costo dominante, R2 reduce drásticamente la factura. Si se requiere AWS por compliance, se puede usar **S3 + CloudFront** con pricing comprometido.
+
+### Nota sobre el impacto del cache local
+
+El cache cifrado en Electron reduce el egress real entre un **70–90%**, ya que los locales solo descargan tracks nuevos. Esto significa que los costos de CDN/egress en la tabla ya contemplan el peor caso; en operación real serán significativamente menores.
+
+---
+
+## 12. Roadmap de fases
 
 ```mermaid
 gantt
