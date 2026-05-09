@@ -95,7 +95,7 @@ sequenceDiagram
     participant RD as Redis
     participant CDN as CloudFront + S3
 
-    rect rgb(26, 115, 232)
+    rect rgb(173, 216, 230)
         Note over E,CDN: Flujo online — descarga y cifrado
         E->>API: Heartbeat + estado actual
         API->>RD: Actualiza estado del local
@@ -107,7 +107,7 @@ sequenceDiagram
         CDN-->>E: Chunks cifrados (5–15s cada uno)
     end
 
-    rect rgb(230, 81, 0)
+    rect rgb(255, 204, 153)
         Note over E,E: Reproducción local (online u offline)
         E->>E: Almacena chunks cifrados en disco (UUID sin extensión)
         E->>E: Descifra chunk en RAM → reproduce → descarta de memoria
@@ -155,8 +155,8 @@ stateDiagram-v2
     Alerta_Expiracion --> Sin_Musica: Sin reconexión
     Sin_Musica --> [*]
 
-    classDef cifrado fill:#1a73e8,color:#fff
-    classDef offline fill:#e65100,color:#fff
+    classDef cifrado fill:#b3d9ff,color:#000
+    classDef offline fill:#ffcc99,color:#000
 
     class Online,Sincronizando cifrado
     class Offline,Reproduciendo_Cache,Alerta_Expiracion,Sin_Musica offline
