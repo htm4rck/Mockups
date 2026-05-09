@@ -33,9 +33,10 @@ La base de datos principal es **PostgreSQL**. Se usa **Redis** para estado en ti
 Todo el código propio se dockeriza y corre en **ECS Fargate** (serverless containers). Los servicios de datos se consumen como managed services de AWS.
 
 ```mermaid
-graph TD
+graph TB
     subgraph ECS["ECS Fargate / EKS"]
-        subgraph API["Contenedor: nestjs-api"]
+        direction LR
+        subgraph API["nestjs-api"]
             A1[Auth / Empresas / Locales]
             A2[Catálogo musical]
             A3[Playlists y programación horaria]
@@ -44,21 +45,22 @@ graph TD
             A6[WebSockets — estado en tiempo real]
         end
 
-        subgraph WK["Contenedor: worker"]
-            W1[Procesamiento de eventos de reproducción]
+        subgraph WK["worker"]
+            W1[Procesamiento de eventos]
             W2[Analytics y agregaciones]
             W3[Notificaciones y alertas]
             W4[Sincronización de playlists]
         end
 
-        subgraph RMQ["Contenedor: rabbitmq"]
-            R1[Cola de eventos de reproducción]
+        subgraph RMQ["rabbitmq"]
+            R1[Cola de reproducción]
             R2[Cola de sincronización]
             R3[Cola de notificaciones]
         end
     end
 
     subgraph AWS["Servicios Managed AWS"]
+        direction LR
         PG[(RDS PostgreSQL)]
         RD[(ElastiCache Redis)]
         S3[S3]
@@ -68,14 +70,14 @@ graph TD
 
     API --> PG
     API --> RD
-    API --> RMQ
     API --> S3
-    WK --> RMQ
+    API --> CW
     WK --> PG
     WK --> RD
-    S3 --> CDN
-    API --> CW
     WK --> CW
+    API --> RMQ
+    WK --> RMQ
+    S3 --> CDN
 ```
 
 ---
@@ -93,16 +95,24 @@ sequenceDiagram
     participant RD as Redis
     participant CDN as CloudFront + S3
 
-    E->>API: Heartbeat + estado actual
-    API->>RD: Actualiza estado del local
-    E->>API: Solicita playlist activa según horario
-    API-->>E: Playlist autorizada + tokens temporales
-    E->>API: Solicita clave de sesión (JWT + device fingerprint)
-    API-->>E: Clave AES efímera (solo válida por sesión)
-    E->>CDN: Descarga chunks con token firmado de corta duración
-    CDN-->>E: Chunks cifrados (5–15s cada uno)
-    E->>E: Almacena chunks cifrados en disco (UUID sin extensión)
-    E->>E: Descifra chunk en RAM → reproduce → descarta de memoria
+    rect rgb(26, 115, 232)
+        Note over E,CDN: Flujo online — descarga y cifrado
+        E->>API: Heartbeat + estado actual
+        API->>RD: Actualiza estado del local
+        E->>API: Solicita playlist activa según horario
+        API-->>E: Playlist autorizada + tokens temporales
+        E->>API: Solicita clave de sesión (JWT + device fingerprint)
+        API-->>E: Clave AES efímera (solo válida por sesión)
+        E->>CDN: Descarga chunks con token firmado de corta duración
+        CDN-->>E: Chunks cifrados (5–15s cada uno)
+    end
+
+    rect rgb(230, 81, 0)
+        Note over E,E: Reproducción local (online u offline)
+        E->>E: Almacena chunks cifrados en disco (UUID sin extensión)
+        E->>E: Descifra chunk en RAM → reproduce → descarta de memoria
+    end
+
     E->>API: Log de reproducción (canción, minuto, local)
     API->>RD: Pub/Sub — evento de reproducción
 ```
@@ -144,6 +154,12 @@ stateDiagram-v2
     Reproduciendo_Cache --> Alerta_Expiracion: Cache > límite configurado\n24h / 48h / 72h
     Alerta_Expiracion --> Sin_Musica: Sin reconexión
     Sin_Musica --> [*]
+
+    classDef cifrado fill:#1a73e8,color:#fff
+    classDef offline fill:#e65100,color:#fff
+
+    class Online,Sincronizando cifrado
+    class Offline,Reproduciendo_Cache,Alerta_Expiracion,Sin_Musica offline
 ```
 
 El límite de reproducción offline es configurable por cliente (24, 48 o 72 horas). Pasado ese límite sin reconexión, el sistema emite una alerta y detiene la reproducción para cumplir con las políticas de licencias. Al reconectar, el backend entrega una nueva clave y el player re-cifra el cache existente.
