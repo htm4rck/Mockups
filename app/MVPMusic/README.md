@@ -10,8 +10,6 @@
 
 La aplicación instalada en cada local se construye con **Electron + React**. Esta decisión cubre restaurantes, hoteles y tiendas con conexión inestable, ya que Electron permite cache local cifrado, control directo del player, logs de reproducción, watchdog y reproducción offline.
 
-Para locales con conectividad estable y sin requerimiento de offline, existe una alternativa como **PWA Angular** ejecutada desde el navegador. Para despliegues en tablets o celulares, se contempla una **app móvil Android** en fases posteriores.
-
 ```mermaid
 graph TD
     subgraph Local["Local / Restaurante"]
@@ -21,11 +19,6 @@ graph TD
         EL --> OF[Modo offline controlado]
         EL --> HB[Heartbeat cada X segundos]
         EL --> LG[Logs de reproducción]
-    end
-
-    subgraph Alternativas["Alternativas de cliente"]
-        PWA[PWA Angular\nConexión estable]
-        AND[App Android\nTablets y móviles]
     end
 ```
 
@@ -37,100 +30,108 @@ El backend se implementa con **NestJS**, que provee velocidad de desarrollo, sop
 
 La base de datos principal es **PostgreSQL**. Se usa **Redis** para estado en tiempo real, cache y mensajería ligera. La mensajería asíncrona se gestiona con **RabbitMQ** en etapas iniciales, escalando a **Kafka** si el volumen de eventos lo requiere.
 
+Todo el código propio se dockeriza y corre en **ECS Fargate** (serverless containers). Los servicios de datos se consumen como managed services de AWS.
+
 ```mermaid
 graph TD
-    subgraph NestJS["Backend NestJS"]
-        AU[Auth / Empresas / Locales]
-        CT[Catálogo musical]
-        PL[Playlists]
-        SC[Programación por horario]
-        LI[Licencias y suscripciones]
-        TR[Tracking en tiempo real]
-        AN[Analytics]
-        NT[Notificaciones]
-        AD[API Admin]
+    subgraph ECS["ECS Fargate / EKS"]
+        subgraph API["Contenedor: nestjs-api"]
+            A1[Auth / Empresas / Locales]
+            A2[Catálogo musical]
+            A3[Playlists y programación horaria]
+            A4[Licencias y suscripciones]
+            A5[API Admin]
+            A6[WebSockets — estado en tiempo real]
+        end
+
+        subgraph WK["Contenedor: worker"]
+            W1[Procesamiento de eventos de reproducción]
+            W2[Analytics y agregaciones]
+            W3[Notificaciones y alertas]
+            W4[Sincronización de playlists]
+        end
+
+        subgraph RMQ["Contenedor: rabbitmq"]
+            R1[Cola de eventos de reproducción]
+            R2[Cola de sincronización]
+            R3[Cola de notificaciones]
+        end
     end
 
-    subgraph Infra["Infraestructura AWS"]
+    subgraph AWS["Servicios Managed AWS"]
         PG[(RDS PostgreSQL)]
         RD[(ElastiCache Redis)]
-        MQ[RabbitMQ Docker / Amazon MQ]
-        ST[S3]
+        S3[S3]
         CDN[CloudFront]
-        OB[CloudWatch · X-Ray · Grafana AMG]
-        DK[ECS Fargate / EKS]
+        CW[CloudWatch · X-Ray]
     end
 
-    NestJS --> PG
-    NestJS --> RD
-    NestJS --> MQ
-    NestJS --> ST
-    ST --> CDN
-    NestJS --> OB
-    NestJS --> DK
+    API --> PG
+    API --> RD
+    API --> RMQ
+    API --> S3
+    WK --> RMQ
+    WK --> PG
+    WK --> RD
+    S3 --> CDN
+    API --> CW
+    WK --> CW
 ```
 
 ---
 
-## 3. Entrega de audio
+## 3. Entrega de audio — Flujo completo, protección y modo offline
 
-El audio no se sirve directamente desde el backend. Se almacena en **object storage** y se entrega a través de **CDN**, lo que garantiza baja latencia, alta disponibilidad y escalabilidad sin costo de egress innecesario.
+El audio no se sirve directamente desde el backend. Se almacena en **S3** y se entrega a través de **CloudFront**, lo que garantiza baja latencia, alta disponibilidad y escalabilidad. El contenido **nunca llega al local como archivo MP3/AAC completo**: se fragmenta, cifra y almacena como chunks inutilizables sin la clave del backend.
 
-```mermaid
-graph LR
-    UP[Carga de contenido] --> ST
-
-    subgraph Storage["Object Storage"]
-        ST[Cloudflare R2\nAWS S3\nAzure Blob]
-    end
-
-    subgraph Entrega["CDN / Entrega"]
-        CF[Cloudflare CDN]
-        CFF[CloudFront + MediaConvert\nSi hay video]
-        AZ[Azure CDN\n⚠️ Sin Azure Media Services\nRetirado jun 2024]
-        CS[Cloudflare Stream\nVideo: almacenamiento\ncodificación y entrega]
-    end
-
-    ST --> CF
-    ST --> CFF
-    ST --> AZ
-    ST --> CS
-
-    CF --> EL[Electron App]
-    CFF --> EL
-    AZ --> EL
-    CS --> EL
-```
-
-> **Nota:** Azure Media Services fue retirado el 30 de junio de 2024. No se debe usar AMS como base de la solución de video.
-
----
-
-## 4. Flujo de reproducción
+### Flujo de reproducción
 
 ```mermaid
 sequenceDiagram
     participant E as Electron App
     participant API as NestJS API
     participant RD as Redis
-    participant CDN as CDN / Storage
+    participant CDN as CloudFront + S3
 
     E->>API: Heartbeat + estado actual
     API->>RD: Actualiza estado del local
     E->>API: Solicita playlist activa según horario
-    API->>RD: Consulta cache de playlist
-    RD-->>API: Respuesta (hit o miss)
     API-->>E: Playlist autorizada + tokens temporales
-    E->>CDN: Descarga tracks con token firmado
-    CDN-->>E: Audio MP3 / AAC
-    E->>E: Reproduce y guarda en cache local
+    E->>API: Solicita clave de sesión (JWT + device fingerprint)
+    API-->>E: Clave AES efímera (solo válida por sesión)
+    E->>CDN: Descarga chunks con token firmado de corta duración
+    CDN-->>E: Chunks cifrados (5–15s cada uno)
+    E->>E: Almacena chunks cifrados en disco (UUID sin extensión)
+    E->>E: Descifra chunk en RAM → reproduce → descarta de memoria
     E->>API: Log de reproducción (canción, minuto, local)
     API->>RD: Pub/Sub — evento de reproducción
 ```
 
----
+### Fragmentación y cifrado local (modelo inspirado en Spotify)
 
-## 5. Modo offline
+| Capa | Mecanismo |
+|------|----------|
+| Fragmentación | Cada track se divide en chunks de 5–15 segundos durante la descarga |
+| Cifrado por chunk | Cada fragmento se cifra con AES-256-GCM usando una clave derivada por sesión |
+| Clave efímera | La clave se obtiene del backend y se almacena **solo en RAM** (nunca en disco) |
+| Rotación de claves | Las claves rotan cada vez que el local se reconecta; el cache se re-cifra |
+| Sin archivo reconstruible | Los chunks no contienen headers válidos; sin la clave + mapa de fragmentos, el audio es inútil |
+| Integridad | Cada chunk incluye un HMAC; si falla validación, se descarta y re-descarga |
+| Ofuscación | Archivos en disco con nombres UUID sin extensión, sin metadatos legibles |
+
+### ¿Qué pasa si un usuario intenta extraer el audio?
+
+| Ataque | Mitigación |
+|--------|------------|
+| Copiar archivos del disco | Solo obtiene blobs cifrados sin headers, inútiles sin clave |
+| Interceptar tráfico de red | CDN entrega chunks con token firmado de corta duración; HTTPS obligatorio |
+| Dump de memoria RAM | Requiere acceso root; solo expone el chunk actual (5–15s), no el track completo |
+| Descompilar Electron (ASAR) | Código ofuscado; la clave nunca está hardcodeada, se obtiene del backend por sesión |
+| Grabar salida de audio (loopback) | Fuera del alcance técnico; se mitiga contractualmente |
+
+> **Principio:** El cache local es un buffer de reproducción cifrado, no una biblioteca de archivos. Sin conexión al backend para obtener la clave, el cache expira y se vuelve irrecuperable.
+
+### Modo offline
 
 ```mermaid
 stateDiagram-v2
@@ -145,11 +146,11 @@ stateDiagram-v2
     Sin_Musica --> [*]
 ```
 
-El límite de reproducción offline es configurable por cliente (24, 48 o 72 horas). Pasado ese límite sin reconexión, el sistema emite una alerta y detiene la reproducción para cumplir con las políticas de licencias.
+El límite de reproducción offline es configurable por cliente (24, 48 o 72 horas). Pasado ese límite sin reconexión, el sistema emite una alerta y detiene la reproducción para cumplir con las políticas de licencias. Al reconectar, el backend entrega una nueva clave y el player re-cifra el cache existente.
 
 ---
 
-## 6. Usos de Redis
+## 4. Usos de Redis
 
 Redis gestiona estado efímero y comunicación en tiempo real. El contenido de audio vive exclusivamente en storage y CDN.
 
@@ -169,7 +170,7 @@ mindmap
 
 ---
 
-## 7. Capacidades del sistema
+## 5. Capacidades del sistema
 
 ### En cada local
 
@@ -218,7 +219,7 @@ mindmap
 
 ---
 
-## 8. Stack tecnológico
+## 6. Stack tecnológico
 
 ```mermaid
 graph LR
@@ -264,55 +265,7 @@ graph LR
 
 ---
 
-## 9. Protección de audio — Fragmentación y cifrado local
-
-El audio almacenado en cache local **nunca se guarda como archivos MP3/AAC completos**. Se aplica un esquema de fragmentación y cifrado inspirado en el modelo de Spotify (OGG fragmentado con claves efímeras), adaptado al contexto B2B.
-
-### Estrategia técnica
-
-| Capa | Mecanismo |
-|------|----------|
-| Fragmentación | Cada track se divide en chunks de 5–15 segundos durante la descarga |
-| Cifrado por chunk | Cada fragmento se cifra con AES-256-GCM usando una clave derivada por sesión |
-| Clave efímera | La clave de descifrado se obtiene del backend y se almacena solo en memoria (nunca en disco) |
-| Rotación de claves | Las claves rotan cada vez que el local se reconecta; el cache se re-cifra con la nueva clave |
-| Sin archivo reconstruible | Los chunks no contienen headers válidos de MP3/AAC; sin la clave + el mapa de fragmentos, el audio es inútil |
-| Integridad | Cada chunk incluye un HMAC que el player valida antes de reproducir; si falla, se descarta y re-descarga |
-| Ofuscación de storage | Los archivos en disco usan nombres UUID sin extensión, sin metadatos legibles |
-
-### Flujo de reproducción segura
-
-```mermaid
-sequenceDiagram
-    participant E as Electron Player
-    participant M as Memory (RAM)
-    participant D as Disco (Cache cifrado)
-    participant API as Backend
-
-    E->>API: Solicita clave de sesión (JWT + device fingerprint)
-    API-->>E: Clave AES efímera (válida por sesión)
-    E->>M: Almacena clave solo en RAM
-    E->>D: Lee chunk cifrado del disco
-    E->>M: Descifra chunk en memoria
-    M-->>E: PCM decodificado → reproduce
-    Note over E,D: Si el proceso muere, la clave se pierde.<br/>Al reiniciar, solicita nueva clave al backend.
-```
-
-### ¿Qué pasa si un usuario intenta extraer el audio?
-
-| Ataque | Mitigación |
-|--------|------------|
-| Copiar archivos del disco | Solo obtiene blobs cifrados sin headers, inútiles sin clave |
-| Interceptar tráfico de red | CDN entrega chunks con token firmado de corta duración; HTTPS obligatorio |
-| Dump de memoria RAM | Requiere acceso root; solo expone el chunk actual (5–15s), no el track completo |
-| Descompilar Electron (ASAR) | El código se ofusca y la clave nunca está hardcodeada; se obtiene del backend por sesión |
-| Grabar salida de audio (loopback) | Fuera del alcance técnico; se mitiga contractualmente en los términos de servicio |
-
-> **Principio:** El cache local es un buffer de reproducción cifrado, no una biblioteca de archivos. Sin conexión al backend para obtener la clave, el cache expira y se vuelve irrecuperable.
-
----
-
-## 10. Sesiones — Modelo 1:1 por tipo de aplicación
+## 8. Sesiones — Modelo 1:1 por tipo de aplicación
 
 Cada tipo de cliente tiene un modelo de sesión distinto, diseñado para evitar uso compartido de credenciales y proteger el contenido.
 
@@ -363,7 +316,7 @@ sequenceDiagram
 
 ---
 
-## 11. Costos de infraestructura
+## 9. Costos de infraestructura
 
 Estimación de costos mensuales para distintas escalas de operación. Los precios son referenciales y varían según proveedor y negociación.
 
@@ -466,7 +419,7 @@ graph TD
 
 ---
 
-## 12. Roadmap de fases
+## 10. Roadmap de fases
 
 ```mermaid
 gantt
